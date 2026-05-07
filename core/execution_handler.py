@@ -283,6 +283,7 @@ class ExecutionHandler:
             "data_profiler":     self._run_data_profiler,
             "sample_gen":        self._run_sample_gen,
             "ingestion_cfg_gen": self._run_ingestion_cfg,
+            "dq_recommender_v2_profiler": self._run_dq_v2_profiler,
         }
         handler = handlers.get(agent_id)
         if not handler:
@@ -309,12 +310,42 @@ class ExecutionHandler:
     def _run_data_profiler(self, metadata: list[dict], user_context: str) -> dict:
         """
         Profile tables. Three tiers:
-          1. Live SQL warehouse query (if DATABRICKS_WAREHOUSE_ID is set) → full stats
-          2. Metadata passthrough (if stats already present) → show what we have
-          3. Empty table / schema-only → honest null stats with explanation
+        1. Live SQL warehouse query (if DATABRICKS_WAREHOUSE_ID is set) → full stats
+        2. Metadata passthrough (if stats already present) → show what we have
+        3. Empty table / schema-only → honest null stats with explanation
+
+        Per-column profiling output includes:
+        - null_count          : absolute number of null values
+        - null_pct            : percentage of null values (0.0 – 100.0)
+        - distinct_count      : absolute number of distinct non-null values
+        - distinct_pct        : percentage of distinct values relative to row count (0.0 – 100.0)
+        - min_value           : minimum value (numeric / date columns)
+        - max_value           : maximum value (numeric / date columns)
+        - sample_values       : up to 5 representative non-null values
+        - likely_pk / likely_fk : heuristic key-type inference from column name
+        - stats_source        : 'live_warehouse' | 'metadata' | 'none – …'
         """
         profiles = []
         wh = self._warehouse_id
+
+        # Data types for which min/max are meaningful
+        NUMERIC_TYPES = {
+            "int", "integer", "bigint", "smallint", "tinyint",
+            "float", "double", "decimal", "numeric", "real",
+            "long", "short", "byte",
+        }
+        DATE_TYPES = {"date", "timestamp", "datetime", "timestamp_ntz"}
+
+        def _is_minmax_type(dtype: str) -> bool:
+            """Return True if min/max make sense for this data type."""
+            base = dtype.lower().split("(")[0].strip()   # strip precision, e.g. decimal(18,2)
+            return base in NUMERIC_TYPES or base in DATE_TYPES
+
+        def _safe_pct(numerator, denominator) -> float | None:
+            """Return rounded percentage or None if inputs are missing/zero."""
+            if numerator is None or denominator is None or denominator == 0:
+                return None
+            return round((int(numerator) / int(denominator)) * 100, 2)
 
         for meta in metadata:
             table_name = meta.get("table_name", "unknown")
@@ -330,36 +361,113 @@ class ExecutionHandler:
                 dtype    = col.get("data_type", "string")
                 nullable = col.get("nullable", True)
 
-                # Check if stats already present in metadata
-                has_null_pct      = col.get("null_pct")      is not None
-                has_distinct      = col.get("distinct_count") is not None
+                # Check if stats already present in metadata (Tier 2 eligibility)
+                has_null_count    = col.get("null_count")      is not None
+                has_null_pct      = col.get("null_pct")        is not None
+                has_distinct      = col.get("distinct_count")  is not None
+                has_distinct_pct  = col.get("distinct_pct")    is not None
+                has_min           = col.get("min_value")       is not None
+                has_max           = col.get("max_value")       is not None
                 has_samples       = bool(col.get("sample_values"))
 
+                has_any_stats = any([
+                    has_null_count, has_null_pct,
+                    has_distinct, has_distinct_pct,
+                    has_min, has_max,
+                    has_samples,
+                ])
+
+                # ── Tier 1: Live SQL warehouse ──────────────────────────────────
                 if wh and row_count > 0:
-                    # Tier 1: Live SQL stats
                     try:
-                        null_count    = _scalar_sql(f"SELECT COUNT(*) FROM {full_name} WHERE `{col_name}` IS NULL", wh)
-                        distinct_count= _scalar_sql(f"SELECT COUNT(DISTINCT `{col_name}`) FROM {full_name}", wh)
-                        sample_rows   = _run_sql_warehouse(
-                            f"SELECT DISTINCT `{col_name}` FROM {full_name} WHERE `{col_name}` IS NOT NULL LIMIT 5",
+                        # Null count
+                        null_count = int(
+                            _scalar_sql(
+                                f"SELECT COUNT(*) FROM {full_name} WHERE `{col_name}` IS NULL",
+                                wh
+                            ) or 0
+                        )
+
+                        # Distinct count (non-null)
+                        distinct_count = int(
+                            _scalar_sql(
+                                f"SELECT COUNT(DISTINCT `{col_name}`) FROM {full_name} "
+                                f"WHERE `{col_name}` IS NOT NULL",
+                                wh
+                            ) or 0
+                        )
+
+                        # Min / Max — only for numeric and date types
+                        if _is_minmax_type(dtype):
+                            min_value = _scalar_sql(
+                                f"SELECT MIN(`{col_name}`) FROM {full_name}", wh
+                            )
+                            max_value = _scalar_sql(
+                                f"SELECT MAX(`{col_name}`) FROM {full_name}", wh
+                            )
+                            # Stringify for consistent serialisation
+                            min_value = str(min_value) if min_value is not None else None
+                            max_value = str(max_value) if max_value is not None else None
+                        else:
+                            min_value = None
+                            max_value = None
+
+                        # Sample values (up to 5 distinct non-null)
+                        sample_rows = _run_sql_warehouse(
+                            f"SELECT DISTINCT `{col_name}` FROM {full_name} "
+                            f"WHERE `{col_name}` IS NOT NULL LIMIT 5",
                             wh, "", ""
                         )
-                        null_pct      = round(int(null_count or 0) / max(row_count, 1), 4)
                         sample_values = [str(r[0]) for r in sample_rows if r[0] is not None]
+
+                        # Derived percentages
+                        null_pct     = _safe_pct(null_count, row_count)
+                        distinct_pct = _safe_pct(distinct_count, row_count)
+
+                        stats_source = "live_warehouse"
+
                     except Exception:
-                        null_pct = distinct_count = None
-                        sample_values = []
-                elif has_null_pct or has_distinct or has_samples:
-                    # Tier 2: Use whatever stats came in the metadata
+                        # Graceful degradation — live query failed
+                        null_count = distinct_count = None
+                        null_pct = distinct_pct     = None
+                        min_value = max_value        = None
+                        sample_values                = []
+                        stats_source                 = "live_warehouse_error"
+
+                # ── Tier 2: Passthrough from incoming metadata ──────────────────
+                elif has_any_stats:
+                    null_count     = col.get("null_count")
                     null_pct       = col.get("null_pct")
                     distinct_count = col.get("distinct_count")
+                    distinct_pct   = col.get("distinct_pct")
+                    min_value      = col.get("min_value")
+                    max_value      = col.get("max_value")
                     sample_values  = col.get("sample_values", [])[:5]
-                else:
-                    # Tier 3: No data available — honest nulls
-                    null_pct = distinct_count = None
-                    sample_values = []
 
-                # Infer key type from name
+                    # Back-fill any missing derived metrics if raw counts are available
+                    if null_count is None and null_pct is not None and row_count:
+                        null_count = round((null_pct / 100) * row_count)
+
+                    if null_pct is None and null_count is not None:
+                        null_pct = _safe_pct(null_count, row_count)
+
+                    if distinct_pct is None and distinct_count is not None:
+                        distinct_pct = _safe_pct(distinct_count, row_count)
+
+                    stats_source = "metadata"
+
+                # ── Tier 3: No data available — honest nulls ────────────────────
+                else:
+                    null_count     = None
+                    null_pct       = None
+                    distinct_count = None
+                    distinct_pct   = None
+                    min_value      = None
+                    max_value      = None
+                    sample_values  = []
+                    stats_source   = "none — table is empty or no warehouse configured"
+
+                # ── Heuristic key-type inference ────────────────────────────────
                 is_likely_pk = (
                     col_name.lower() == f"{table_name.lower()}_id"
                     or (col_name.lower().endswith("_id") and not nullable)
@@ -373,36 +481,60 @@ class ExecutionHandler:
                     "name":           col_name,
                     "data_type":      dtype,
                     "nullable":       nullable,
-                    "null_pct":       null_pct,
+
+                    # ── Null metrics ──
+                    "null_count":     null_count,
+                    "null_pct":       null_pct,       # e.g. 12.50 means 12.50 %
+
+                    # ── Distinct metrics ──
                     "distinct_count": distinct_count,
+                    "distinct_pct":   distinct_pct,   # e.g. 98.00 means 98.00 %
+
+                    # ── Range metrics (numeric / date only) ──
+                    "min_value":      min_value,
+                    "max_value":      max_value,
+
+                    # ── Samples & meta ──
                     "sample_values":  sample_values,
                     "likely_pk":      is_likely_pk,
                     "likely_fk":      is_likely_fk,
-                    "stats_source":   (
-                        "live_warehouse" if (wh and row_count > 0)
-                        else "metadata"  if (has_null_pct or has_distinct or has_samples)
-                        else "none — table is empty or no warehouse configured"
-                    ),
+                    "stats_source":   stats_source,
                 })
 
+            # ── Build table-level summary ────────────────────────────────────────
+            total_null_cells = (
+                sum(c["null_count"] for c in profiled_cols if c["null_count"] is not None)
+                if any(c["null_count"] is not None for c in profiled_cols)
+                else None
+            )
+            total_cells = row_count * len(cols) if row_count and cols else None
+            overall_null_pct = _safe_pct(total_null_cells, total_cells)
+
             profiles.append({
-                "table_name":    table_name,
-                "fully_qualified_name": full_name,
-                "database":      database,
-                "row_count":     row_count,
-                "column_count":  len(cols),
-                "stats_note":    (
+                "table_name":             table_name,
+                "fully_qualified_name":   full_name,
+                "database":               database,
+                "row_count":              row_count,
+                "column_count":           len(cols),
+
+                # ── Table-level summary metrics ──
+                "total_null_cells":       total_null_cells,
+                "overall_null_pct":       overall_null_pct,  # across all columns
+
+                "stats_note": (
                     "Live stats from SQL warehouse."
                     if wh and row_count > 0
                     else "Table is empty — no row-level stats available. "
-                         "Set SQL Warehouse ID in Advanced Options to profile non-empty tables."
+                        "Set SQL Warehouse ID in Advanced Options to profile non-empty tables."
                     if row_count == 0
-                    else "Stats from catalog metadata (null_pct/distinct_count from INFORMATION_SCHEMA)."
+                    else "Stats from catalog metadata (null_pct / distinct_count from INFORMATION_SCHEMA)."
                 ),
-                "columns":       profiled_cols,
+
+                "columns": profiled_cols,
             })
 
         return {"status": "success", "output": {"profiles": profiles}}
+
 
     # ── SAMPLE DATA GENERATOR ─────────────────────────────────────────────────
 
@@ -601,7 +733,79 @@ class ExecutionHandler:
             })
 
         return {"status": "success", "output": {"ingestion_configs": configs}}
+    
+    # ── DQ RECOMMENDER V2 — PROFILER STEP ────────────────────────────────────
 
+    def _run_dq_v2_profiler(self, metadata: list[dict], user_context: str) -> dict:
+        ctx          = _parse_context(user_context)
+        sample_size  = 0
+        warehouse_id = ""
+
+        for key in ("sample_size", "sample size", "rows"):
+            if key in ctx:
+                try:
+                    sample_size = max(0, int(ctx[key]))
+                    break
+                except ValueError:
+                    pass
+
+        for key in ("warehouse_id", "sql_warehouse_id", "warehouse id"):
+            if key in ctx:
+                warehouse_id = ctx[key].strip()
+                break
+
+        if not warehouse_id:
+            warehouse_id = os.getenv("DATABRICKS_WAREHOUSE_ID", "")
+
+        if not warehouse_id:
+            return {
+                "status": "error",
+                "output": {},
+                "error":  (
+                    "No SQL Warehouse ID provided. "
+                    "Please enter a Warehouse ID in the profiling options."
+                ),
+            }
+
+        table_refs = []
+        for meta in metadata:
+            fqn = meta.get("fully_qualified_name") or (
+                f"{meta['database']}.{meta['table_name']}"
+                if meta.get("database")
+                else meta.get("table_name", "")
+            )
+            if fqn:
+                table_refs.append(fqn)
+
+        if not table_refs:
+            return {
+                "status": "error",
+                "output": {},
+                "error":  "No valid table references found in loaded metadata.",
+            }
+
+        try:
+            import importlib.util
+            profiler_path = (
+                self._base_dir / "agents" / "dq_recommender_v2" / "profiler.py"
+            )
+            spec   = importlib.util.spec_from_file_location(
+                "dq_v2_profiler", profiler_path
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            result = module.run_profiler(
+                warehouse_id=warehouse_id,
+                table_refs=table_refs,
+                sample_size=sample_size,
+            )
+            return {"status": "success", "output": result}
+
+        except Exception as e:
+            logger.error(f"DQ V2 profiler failed: {e}")
+            return {"status": "error", "output": {}, "error": str(e)}
+    
     # ── UC registration ───────────────────────────────────────────────────────
 
     def _register_to_uc(self, agent_id: str, result: dict) -> None:
