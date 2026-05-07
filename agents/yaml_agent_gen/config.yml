@@ -1,0 +1,12 @@
+agent_settings:
+  execution_type: "non_agentic"
+  display_name: "Mapping Transformation to YAML Rule"
+  description: "Convert mapping.csv files into YAML rule definitions using deterministic Python logic (No LLM usage)."
+
+  runtime:
+    language: python
+    entry_point: app.py   # UI entry point
+
+  ui:
+    enabled: true
+    type: streamlit
