@@ -116,3 +116,20 @@ agents:
     enabled: true
     config_path: "agents/ingestion_cfg/config.yaml"
     tags: ["ingestion", "autoloader", "pipeline"]
+
+  - id: sims_yaml_gen
+    display_name: Mapping Transformation → YAML Rule Conversion
+    description: >Upload mapping.csv files (drag & browse from local machine) and generate
+    deterministic SIMS 2.0 YAML rule definitions. Pure Python execution,
+    no LLM usage.
+    category: "Excel"
+    type: "non_agentic"
+    icon: "📄"
+    enabled: true
+    config_path: "agents/yaml_cfg/config.yaml"
+    tags:
+    - SIMS
+    - YAML
+    - Migration
+    - Non-LLM
+    - CSV
