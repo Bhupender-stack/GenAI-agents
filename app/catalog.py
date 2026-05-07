@@ -1,15 +1,9 @@
 """
 catalog.py
 Data Engineering Agent Platform
-Mapping CSV → YAML Rule Conversion
+Mapping Transformation → YAML Rule Conversion
 
-FINAL VERSION
-- Multi-file upload
-- Order independent
-- Merge-safe
-- One YAML per detected table
-- ZIP output
-- Non-agentic
+FINAL STABLE VERSION
 """
 
 import sys
@@ -21,14 +15,14 @@ import streamlit as st
 import pandas as pd
 
 # ------------------------------------------------------------------
-# Ensure project root available in PYTHONPATH
+# Ensure project root is on PYTHONPATH (Databricks Apps)
 # ------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 # ------------------------------------------------------------------
-# Import final merge-safe logic
+# Import merge-safe YAML logic
 # ------------------------------------------------------------------
 from agents.yaml_agent_gen.logic import generate_yaml_from_multiple_dfs
 
@@ -44,7 +38,7 @@ st.set_page_config(
 )
 
 # ------------------------------------------------------------------
-# SIDEBAR
+# SIDEBAR – agent selection
 # ------------------------------------------------------------------
 st.sidebar.markdown("## 🤖 Agent Catalog")
 chosen_id = st.sidebar.radio(
@@ -61,15 +55,16 @@ st.sidebar.caption("Free (No LLM)")
 st.title("🏗️ Data Engineering Agent Platform")
 
 # ==============================================================
-# YAML GENERATOR AGENT
+# SIMS YAML GENERATOR
 # ==============================================================
 if chosen_id == "sims_yaml_gen":
 
     st.subheader("📄 Mapping Transformation → YAML Rule Conversion")
     st.info(
-        "Upload mapping.csv files in any order. "
-        "The system will automatically detect table type, merge mappings "
-        "per table, and generate one YAML per table in a single ZIP."
+        "Upload mapping.csv files (any order). "
+        "The system auto-detects table type, merges mappings per table, "
+        "and generates exactly one YAML per table in a single ZIP. "
+        "No LLM usage."
     )
 
     st.markdown("---")
@@ -84,7 +79,7 @@ if chosen_id == "sims_yaml_gen":
         st.warning("Upload one or more mapping.csv files to continue.")
         st.stop()
 
-    st.success(f"✅ {len(uploaded_files)} file(s) uploaded")
+    st.success(f"✅ {len(uploaded_files)} mapping file(s) uploaded")
 
     st.markdown("---")
 
@@ -92,7 +87,6 @@ if chosen_id == "sims_yaml_gen":
 
         mapping_dfs = []
 
-        # Read all CSVs
         for file in uploaded_files:
             try:
                 df = pd.read_csv(file)
@@ -101,7 +95,6 @@ if chosen_id == "sims_yaml_gen":
                 st.error(f"❌ Failed to read {file.name}: {e}")
                 st.stop()
 
-        # Generate YAMLs
         try:
             table_to_yaml = generate_yaml_from_multiple_dfs(mapping_dfs)
         except Exception as e:
@@ -112,7 +105,6 @@ if chosen_id == "sims_yaml_gen":
             st.error("❌ No YAML files generated.")
             st.stop()
 
-        # Create ZIP
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
             for table, yaml_text in table_to_yaml.items():
@@ -120,7 +112,9 @@ if chosen_id == "sims_yaml_gen":
 
         zip_buffer.seek(0)
 
-        st.success(f"✅ YAML generated for {len(table_to_yaml)} table(s)")
+        st.success(
+            f"✅ YAML generated successfully for {len(table_to_yaml)} table(s)"
+        )
 
         st.download_button(
             label="⬇️ Download YAML ZIP",
@@ -131,5 +125,5 @@ if chosen_id == "sims_yaml_gen":
 
 st.markdown("---")
 st.caption(
-    "Non‑LLM · Priority‑safe detection · Merge‑aware · Production‑ready"
+    "Free (Non‑LLM) · Priority‑safe detection · Merge‑aware · Deterministic execution"
 )
