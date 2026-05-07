@@ -53,6 +53,16 @@ agents:
     config_path: "agents/dq_recommender/config.yaml"
     tags: ["data-quality", "rules", "governance"]
 
+  - id: dq_recommender_v2 
+    display_name: "DQ Rule Recommender V2"
+    description: "Profile tables and generate evidence-backed Data Quality rules"
+    category: "Data Quality"
+    type: "agentic"
+    icon: "🔬"
+    enabled: true
+    config_path: "agents/dq_recommender_v2/config.yaml"
+    tags: ["data-quality", "rules", "profiling", "governance"]
+
   - id: dq_query_gen
     display_name: "DQ Query Generator"
     description: "Generate executable SQL for data quality checks from DQ rules"
