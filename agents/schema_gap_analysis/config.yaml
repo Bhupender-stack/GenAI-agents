@@ -1,0 +1,153 @@
+# =============================================================================
+# Schema Gap Analysis Agent Configuration
+# =============================================================================
+
+agent:
+  id: schema_gap_analysis
+  display_name: "Schema Gap Analysis"
+  type: non_agentic
+  category: "Data Quality"
+  description: >
+    Performs schema-level and column-level gap analysis between SIMS1 and SIMS2.
+    Supports both manual Excel-based inputs from Databricks Volumes and
+    direct database metadata comparison via catalog and schema selection.
+
+# -----------------------------------------------------------------------------
+# Execution settings
+# -----------------------------------------------------------------------------
+execution:
+  mode: deterministic
+  retry_enabled: false
+  timeout_seconds: 900
+  parallel_execution: false
+
+# -----------------------------------------------------------------------------
+# Supported input modes
+# -----------------------------------------------------------------------------
+inputs:
+  modes:
+    - manual
+    - database
+
+  manual:
+    description: "Excel-based comparison using files stored in Databricks Volumes"
+    required_files:
+      - SIMS1_SCHEMA.xlsx
+      - SIMS2_SCHEMA.xlsx
+      - OBJECT_MAPPING.xlsx
+    optional_files:
+      - SIMS1_SAMPLE_DATA.xlsx
+      - SIMS2_SAMPLE_DATA.xlsx
+
+  database:
+    description: "Direct schema comparison using database metadata"
+    sims1:
+      required:
+        - catalog
+        - schema
+        - tables
+    sims2:
+      required:
+        - catalog
+        - schema
+        - tables
+    object_mapping:
+      source: "local_upload"
+      format: "xlsx"
+
+# -----------------------------------------------------------------------------
+# Matching & comparison rules
+# -----------------------------------------------------------------------------
+comparison:
+  similarity_threshold: 0.7
+
+  column_matching:
+    exact_match: true
+    fuzzy_match: true
+    allow_rename_detection: true
+    ignore_case: true
+
+  unused_column_handling:
+    sims1_only: "Missing in New System"
+    sims2_only: "Added in New System"
+
+# -----------------------------------------------------------------------------
+# Data gap analysis configuration
+# -----------------------------------------------------------------------------
+data_gap:
+  sample_value_limit: 3
+
+  rules:
+    - name: no_data_gap
+      condition: "SIMS1 == SIMS2"
+      label: "No Data Gap"
+
+    - name: null_in_new
+      condition: "SIMS1 not null and SIMS2 null"
+      label: "Mostly NULL in New system"
+
+    - name: null_in_old
+      condition: "SIMS1 null and SIMS2 not null"
+      label: "Mostly NULL in Old system"
+
+    - name: value_difference
+      condition: "SIMS1 != SIMS2"
+      label: "Business validation required"
+
+# -----------------------------------------------------------------------------
+# Output configuration
+# -----------------------------------------------------------------------------
+output:
+  format: excel
+  sheet_name: "Schema Gap Analysis"
+
+  formatting:
+    freeze_header: true
+    wrap_text: true
+    auto_column_width: true
+    max_column_width: 45
+    include_borders: true
+
+  file_naming:
+    prefix: "SCHEMA_GAP_ANALYSIS"
+    timestamp: true
+
+# -----------------------------------------------------------------------------
+# Conditional color coding (Excel)
+# -----------------------------------------------------------------------------
+color_coding:
+  structure_gap:
+    "Attribute Name Match": "GREEN"
+    "Attribute Name Possible Match/Rename": "YELLOW"
+    "Missing in New System": "RED"
+    "Added in New System": "PURPLE"
+
+  data_gap:
+    "No Data Gap": "GREEN"
+    "Mostly NULL in New system": "BLUE"
+    "Mostly NULL in Old system": "BLUE"
+    "Business validation required": "PURPLE"
+
+  palette:
+    GREEN: "#C6EFCE"
+    YELLOW: "#FFEB9C"
+    RED: "#FFC7CE"
+    BLUE: "#BDD7EE"
+    PURPLE: "#E4DFEC"
+
+# -----------------------------------------------------------------------------
+# Audit & reproducibility
+# -----------------------------------------------------------------------------
+audit:
+  deterministic: true
+  log_inputs: true
+  log_rules_applied: true
+  preserve_source_values: true
+
+# -----------------------------------------------------------------------------
+# Future extension flags (not active yet)
+# -----------------------------------------------------------------------------
+experimental:
+  enable_schema_only_mode: false
+  enable_sampling_toggle: false
+  enable_summary_sheet: false
