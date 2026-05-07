@@ -67,14 +67,19 @@ def _to_dataframe(agent_id: str, data):
         if agent_id == "test_query_gen":
             return pd.DataFrame(data.get("queries", [])) or None
 
-        if agent_id == "dq_recommender":
+        if agent_id in ("dq_recommender", "dq_recommender_v2"):
             rows = []
             for tbl in (data.get("tables") if "tables" in data else [data]):
                 for r in tbl.get("dq_rules", []):
                     rows.append({
-                        "table_name": tbl.get("table_name"),
-                        "fully_qualified_name": tbl.get("fully_qualified_name"),
-                        **r
+                        "data_source":        r.get("data_source", "system"),
+                        "table_name":         r.get("table_name", ""),
+                        "attribute_name":     r.get("attribute_name", ""),
+                        "check_type":         r.get("check_type", ""),
+                        "severity":           r.get("severity", "WARNING"),
+                        "dimension":          r.get("dimension", ""),
+                        "sql":                r.get("sql", ""),
+                        "lov_values_comments": r.get("lov_values_comments", ""),
                     })
             return pd.DataFrame(rows) if rows else None
 
@@ -177,21 +182,20 @@ def _render_output(agent_id: str, data):
                 st.markdown(f"**Pass when:** {q.get('pass_condition','')}")
                 st.code(q.get("sql",""), language="sql")
 
-    elif agent_id == "dq_recommender":
+    elif agent_id in ("dq_recommender", "dq_recommender_v2"):
         # Handle single-table {"dq_rules":[...]} and multi-table {"tables":[...]}
         table_list = data.get("tables") if "tables" in data else [data]
         for tbl in table_list:
             rules = tbl.get("dq_rules", [])
-            fqn   = tbl.get("fully_qualified_name") or tbl.get("table_name", "")
-            st.markdown(f"**{fqn}** - {len(rules)} DQ rules")
-            for rule in sorted(rules, key=lambda r: {"P1":0,"P2":1,"P3":2,"P4":3}.get(r.get("priority","P4"),4)):
-                pri = rule.get("priority","P4")
-                col = {"P1":"🔴","P2":"🟠","P3":"🟡","P4":"⚪"}.get(pri,"⚪")
-                target = f"`{rule.get('column')}`" if rule.get("column") else "table-level"
-                with st.expander(f"{col} `{rule.get('rule_id')}` · {rule.get('rule_type')} on {target}"):
-                    st.markdown(f"**{rule.get('description')}**  Threshold: `{rule.get('threshold')}`")
-                    st.markdown(f"Pass when: {rule.get('pass_condition', '')}")
-                    sql_text = rule.get("sql") or rule.get("sql_template") or ""
+            fqn   = rules[0].get("table_name", "") if rules else ""
+            st.markdown(f"**{fqn}** — {len(rules)} DQ rules")
+            for rule in rules:
+                target = f"`{rule.get('attribute_name')}`" if rule.get("attribute_name") else "table-level"
+                header = f"`{rule.get('check_type')}` on {target} · {rule.get('dimension')} · ⚠️ {rule.get('severity','WARNING')}"
+                with st.expander(header):
+                    if comment := rule.get("lov_values_comments"):
+                        st.markdown(f"**Note:** {comment}")
+                    sql_text = rule.get("sql", "")
                     if sql_text:
                         st.code(sql_text, language="sql")
 
@@ -285,6 +289,9 @@ def _init_state():
         "loaded_tables":  [],   # list of metadata dicts built up by the user
         "last_agent_id":  None, # tracks agent switches - clears workspace on change
         "last_result":    None, # most recent AgentResult - shown after run
+        "dqv2_profile_result":  None,  # profiling output after Step 1
+        "dqv2_profile_df":      None,  # profiling output as DataFrame
+        "dqv2_profile_done":    False, # True once profiling has completed
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -353,18 +360,30 @@ AGENT_FORMS = {
     },
     "dq_recommender": {
         "what_is_input": (
-            "Load one or more tables. For each table, the agent recommends "
-            "column-level and table-level DQ rules based on data types, null rates, "
-            "and distinct counts. Loading multiple tables also generates "
-            "referential integrity rules across FK relationships."
+            "Load one or more tables. The agent recommends DQ rules across six check types: "
+            "Null, Uniqueness, Range, Format_Check, LoV, and Referential_Integrity. "
+            "Rules are based on column names, data types, and nullable flags. "
+            "Loading multiple related tables also generates Referential_Integrity rules "
+            "across detected FK relationships. All rules are WARNING severity."
         ),
         "needs_multi": True,
         "min_tables": 1,
         "extra_fields": [
-            {"type": "multiselect", "key": "rule_priorities", "label": "Include priorities",
-             "options": ["P1 - Critical","P2 - High","P3 - Medium","P4 - Low"],
-             "default": ["P1 - Critical","P2 - High","P3 - Medium"]},
+            {"type": "text_input", "key": "data_source",
+             "label": "Data source (optional)",
+             "placeholder": "e.g. Salesforce, SAP, Oracle — leave blank to infer from metadata"},
         ],
+    },
+    "dq_recommender_v2": {
+       "what_is_input": (
+            "Load one or more tables. Choose whether to generate DQ rules directly from "
+            "schema metadata, or to run profiling first for evidence-backed rules. "
+            "Audit columns (starting with aud_) are automatically skipped. "
+            "All rules are WARNING severity."
+        ),
+       "needs_multi": True,
+       "min_tables": 1,
+       "extra_fields": [],   # Rendered manually in the two-step UI block below
     },
     "dq_query_gen": {
         "what_is_input": (
@@ -829,72 +848,422 @@ else:
 # =============================================================================
 # STEP 2 - AGENT OPTIONS + RUN
 # =============================================================================
+if chosen_id != "dq_recommender_v2":
+    st.markdown("---")
+    st.markdown("### Step 2 - Configure and run")
 
-st.markdown("---")
-st.markdown("### Step 2 - Configure and run")
+    min_tables   = form_def.get("min_tables", 1)
+    ready_to_run = len(st.session_state.loaded_tables) >= min_tables
 
-min_tables   = form_def.get("min_tables", 1)
-ready_to_run = len(st.session_state.loaded_tables) >= min_tables
-
-if not ready_to_run:
-    st.warning(
-        f"This agent needs at least **{min_tables} table(s)** in the workspace. "
-        f"You currently have {len(st.session_state.loaded_tables)}."
-    )
-
-extra_fields  = form_def.get("extra_fields", [])
-extra_values: dict = {}
-
-with st.form(key=f"run_form_{chosen_id}"):
-
-    if extra_fields:
-        cols = st.columns(min(len(extra_fields), 2))
-        for i, field in enumerate(extra_fields):
-            with cols[i % 2]:
-                fk = field["key"]
-                fl = field["label"]
-                fh = field.get("help","")
-                if field["type"] == "selectbox":
-                    extra_values[fk] = st.selectbox(fl, field["options"], help=fh)
-                elif field["type"] == "multiselect":
-                    extra_values[fk] = st.multiselect(
-                        fl, field["options"],
-                        default=field.get("default", field["options"][:2]), help=fh,
-                    )
-                elif field["type"] == "number_input":
-                    extra_values[fk] = st.number_input(
-                        fl, min_value=field.get("min_value",0),
-                        max_value=field.get("max_value",100),
-                        value=field.get("default",5), help=fh,
-                    )
-                elif field["type"] == "text_input":
-                    extra_values[fk] = st.text_input(
-                        fl, placeholder=field.get("placeholder",""), help=fh,
-                    )
-                elif field["type"] == "text_area":
-                    extra_values[fk] = st.text_area(
-                        fl, placeholder=field.get("placeholder",""),
-                        height=field.get("height",80), help=fh,
-                    )
-
-    user_context = st.text_area(
-        "Additional context / instructions (optional)",
-        placeholder="e.g. Use SHA-256 hashing. Target catalog is prod_silver. Source system is Salesforce.",
-        height=70,
-    )
-
-    cache_col, run_col = st.columns([2,3])
-    with cache_col:
-        use_cache = st.checkbox("Use prompt cache", value=True,
-                                help="Skip LLM call and return cached result if identical inputs were run before.")
-    with run_col:
-        submitted = st.form_submit_button(
-            f"▶  Run {chosen_meta['display_name']}",
-            type="primary",
-            use_container_width=True,
-            disabled=not ready_to_run,
+    if not ready_to_run:
+        st.warning(
+            f"This agent needs at least **{min_tables} table(s)** in the workspace. "
+            f"You currently have {len(st.session_state.loaded_tables)}."
         )
 
+    extra_fields  = form_def.get("extra_fields", [])
+    extra_values: dict = {}
+
+    with st.form(key=f"run_form_{chosen_id}"):
+
+        if extra_fields:
+            cols = st.columns(min(len(extra_fields), 2))
+            for i, field in enumerate(extra_fields):
+                with cols[i % 2]:
+                    fk = field["key"]
+                    fl = field["label"]
+                    fh = field.get("help","")
+                    if field["type"] == "selectbox":
+                        extra_values[fk] = st.selectbox(fl, field["options"], help=fh)
+                    elif field["type"] == "multiselect":
+                        extra_values[fk] = st.multiselect(
+                            fl, field["options"],
+                            default=field.get("default", field["options"][:2]), help=fh,
+                        )
+                    elif field["type"] == "number_input":
+                        extra_values[fk] = st.number_input(
+                            fl, min_value=field.get("min_value",0),
+                            max_value=field.get("max_value",100),
+                            value=field.get("default",5), help=fh,
+                        )
+                    elif field["type"] == "text_input":
+                        extra_values[fk] = st.text_input(
+                            fl, placeholder=field.get("placeholder",""), help=fh,
+                        )
+                    elif field["type"] == "text_area":
+                        extra_values[fk] = st.text_area(
+                            fl, placeholder=field.get("placeholder",""),
+                            height=field.get("height",80), help=fh,
+                        )
+
+        user_context = st.text_area(
+            "Additional context / instructions (optional)",
+            placeholder="e.g. Use SHA-256 hashing. Target catalog is prod_silver. Source system is Salesforce.",
+            height=70,
+        )
+
+        cache_col, run_col = st.columns([2,3])
+        with cache_col:
+            use_cache = st.checkbox("Use prompt cache", value=True,
+                                    help="Skip LLM call and return cached result if identical inputs were run before.")
+        with run_col:
+            submitted = st.form_submit_button(
+                f"▶  Run {chosen_meta['display_name']}",
+                type="primary",
+                use_container_width=True,
+                disabled=not ready_to_run,
+            )
+
+# =============================================================================
+# DQ RECOMMENDER V2 — TWO-STEP UI
+# Rendered separately from the standard agent form when dq_recommender_v2
+# is selected. All state is confined to st.session_state.dqv2_* keys.
+# No other agents are affected.
+# =============================================================================
+
+if chosen_id == "dq_recommender_v2":
+
+    min_tables   = form_def.get("min_tables", 1)
+    ready_to_run = len(st.session_state.loaded_tables) >= min_tables
+
+    st.markdown("---")
+    st.markdown("### Step 2 — Configure DQ Recommender V2")
+
+    if not ready_to_run:
+        st.warning(
+            f"Load at least **1 table** in the workspace above before continuing. "
+            f"You currently have {len(st.session_state.loaded_tables)}."
+        )
+    else:
+        # ── Shared options ─────────────────────────────────────────────────
+        v2_data_source = st.text_input(
+            "Data source (optional)",
+            placeholder="e.g. SIMS, IQVIA, IDMS, etc. — leave blank to default to System",
+            help="This value appears in the data_source column of the DQ output.",
+        )
+
+        v2_mode = st.radio(
+            "How would you like to generate DQ rules?",
+            ["Schema only (faster, no data access)",
+             "Profile first, then generate DQ (evidence-backed)"],
+            help=(
+                "Schema only: rules based on column names and data types. "
+                "Profile first: SQL-based profiling on your tables to compute null rates, "
+                "distinct counts, patterns etc., then the agent uses these stats "
+                "to generate more accurate, evidence-backed DQ rules."
+            ),
+        )
+        use_profiling = "Profile first" in v2_mode
+
+        if use_profiling:
+            v2_sample_size = st.number_input(
+                "Sample size — rows per table (0 = full table)",
+                min_value=0,
+                max_value=10_000_000,
+                value=0,
+                step=100_000,
+                help=(
+                    "Limits the number of rows read from each table during profiling. "
+                    "Use 0 to profile the full table. "
+                    "For large tables, 100,000-500,000 rows is usually sufficient."
+                ),
+            )
+            v2_warehouse_id = st.text_input(
+                "SQL Warehouse ID",
+                value=os.getenv("DATABRICKS_WAREHOUSE_ID", ""),
+                placeholder="e.g. 3f2a1b4c5d6e7f8a",
+                help=(
+                    "Required for profiling. "
+                    "Find in SQL Warehouses > your warehouse > Connection details."
+                ),
+            )
+
+        # ── Step 2a: Profiling ─────────────────────────────────────────────
+        if use_profiling:
+            st.markdown("#### Step 2a — Run Profiling")
+            st.caption(
+                "Profiling reads your loaded tables. "
+                "No data is passed to the LLM — only the computed statistics are used. "
+                "Audit columns (starting with aud_) are automatically skipped."
+            )
+
+            run_profiling_btn = st.button(
+                "Run Profiling",
+                type="secondary",
+                use_container_width=False,
+                key="run_profiling_btn",
+            )
+
+            if run_profiling_btn:
+                st.session_state.dqv2_profile_result = None
+                st.session_state.dqv2_profile_df     = None
+                st.session_state.dqv2_profile_done   = False
+
+                profile_context = f"Sample size: {v2_sample_size}"
+                if v2_warehouse_id.strip():
+                    profile_context += f"\nWarehouse id: {v2_warehouse_id.strip()}"
+                if v2_data_source.strip():
+                    profile_context += f"\nData source: {v2_data_source.strip()}"
+
+                with st.status(
+                    f"Profiling {len(st.session_state.loaded_tables)} table(s) — please wait...",
+                    expanded=True,
+                ) as prof_status:
+                    st.write("Genrating profiling results for your tables...")
+                    try:    
+                        prof_result = orch.exec_h.run_non_agentic(
+                            agent_id="dq_recommender_v2_profiler",
+                            metadata=st.session_state.loaded_tables,
+                            user_context=profile_context,
+                        )
+                        if prof_result.get("status") == "success":
+                            st.session_state.dqv2_profile_result = prof_result["output"]
+                            st.session_state.dqv2_profile_done   = True
+                            prof_status.update(
+                                label="Profiling complete",
+                                state="complete",
+                                expanded=False,
+                            )
+                        else:
+                            err = prof_result.get("error", "Unknown error")
+                            prof_status.update(
+                                label="Profiling failed",
+                                state="error",
+                                expanded=True,
+                            )
+                            st.error(f"Profiling failed: {err}")
+                    except Exception as e:
+                        prof_status.update(
+                            label="Profiling failed", state="error", expanded=True
+                        )
+                        st.error(f"Profiling error: {e}")
+
+            # Show profiling results if available
+            if st.session_state.dqv2_profile_done and st.session_state.dqv2_profile_result:
+                import pandas as pd
+                prof_output = st.session_state.dqv2_profile_result
+                rows        = prof_output.get("rows", [])
+                summary     = prof_output.get("summary", {})
+
+                st.success(
+                    f"Profiled {summary.get('tables_profiled', '?')} table(s) — "
+                    f"{summary.get('total_columns', '?')} columns — "
+                    f"{summary.get('profiled_at', '')}"
+                )
+
+                if rows:
+                    import pandas as pd
+                    prof_df = pd.DataFrame(rows)
+                    st.session_state.dqv2_profile_df = prof_df
+                    st.dataframe(prof_df, use_container_width=True)
+
+                    dl_col1, dl_col2 = st.columns(2)
+                    with dl_col1:
+                        st.download_button(
+                            "Download Profile as CSV",
+                            data=prof_df.to_csv(index=False).encode("utf-8"),
+                            file_name="profiling_results.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                        )
+                    with dl_col2:
+                        try:
+                            import io
+                            buf = io.BytesIO()
+                            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                                prof_df.to_excel(
+                                    writer, index=False,
+                                    sheet_name="Profiling Results"
+                                )
+                            st.download_button(
+                                "Download Profile as Excel",
+                                data=buf.getvalue(),
+                                file_name="profiling_results.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                use_container_width=True,
+                            )
+                        except ImportError:
+                            st.caption(
+                                "Excel download requires openpyxl. "
+                                "Install with: %pip install openpyxl"
+                            )
+
+        # ── Step 2b: Generate DQ ───────────────────────────────────────────
+        can_generate_dq = (
+            (not use_profiling) or
+            (use_profiling and st.session_state.dqv2_profile_done)
+        )
+
+        if can_generate_dq:
+            step_label = "Step 2b" if use_profiling else "Step 2a"
+            st.markdown(f"#### {step_label} — Generate DQ Rules")
+
+            v2_extra_context = st.text_area(
+                "Additional instructions (optional)",
+                placeholder=(
+                    "e.g. Focus on customer-facing columns. "
+                    "Treat order_id as a primary key. "
+                    "The status column should only contain: active, inactive, pending."
+                ),
+                height=80,
+            )
+
+            generate_dq_btn = st.button(
+                "Generate DQ Rules",
+                type="primary",
+                use_container_width=False,
+                key="generate_dq_btn",
+            )
+
+            if generate_dq_btn:
+                context_parts = []
+                if v2_data_source.strip():
+                    context_parts.append(f"Data source: {v2_data_source.strip()}")
+                if v2_extra_context.strip():
+                    context_parts.append(v2_extra_context.strip())
+                full_context = "\n".join(context_parts)
+
+                # If profiling was done, enrich table metadata with profile stats
+                import copy, pandas as pd
+                dq_metadata = copy.deepcopy(st.session_state.loaded_tables)
+
+                if use_profiling and st.session_state.dqv2_profile_result:
+                    prof_output = st.session_state.dqv2_profile_result
+                    prof_lookup = {}
+                    for row in prof_output.get("rows", []):
+                        tbl = row.get("table_name", "")
+                        col = row.get("column_name", "")
+                        prof_lookup.setdefault(tbl, {})[col] = row
+                    for meta in dq_metadata:
+                        tbl_name = meta.get("table_name", "")
+                        tbl_prof = prof_lookup.get(tbl_name, {})
+                        for col in meta.get("columns", []):
+                            col_name = col.get("name", "")
+                            if col_name in tbl_prof:
+                                col.update(tbl_prof[col_name])
+
+                n_tables   = len(dq_metadata)
+                total_cols = sum(len(t.get("columns", [])) for t in dq_metadata)
+
+                with st.status(
+                    f"Generating DQ rules for {n_tables} table(s) "
+                    f"({total_cols} columns) — please wait...",
+                    expanded=True,
+                ) as dq_status:
+                    st.write(
+                        f"Calling {orch.cfg.llm_config.get('model')}. "
+                        f"This may take 30-120 seconds."
+                    )
+                    dq_result = orch.run(
+                        agent_id="dq_recommender_v2",
+                        metadata=dq_metadata,
+                        user_context=full_context,
+                        use_cache=False,
+                    )
+                    log_entries = getattr(dq_result, "log_entries", [])
+                    if log_entries:
+                        icon_map = {"done": "OK", "error": "FAIL", "warn": "WARN", "info": "INFO"}
+                        for e in log_entries:
+                            icon = icon_map.get(e.level, "INFO")
+                            st.write(f"`{e.timestamp}` {icon} {e.message}")
+
+                    if dq_result.status == "success":
+                        dq_status.update(
+                            label="DQ rules generated",
+                            state="complete", expanded=False,
+                        )
+                    else:
+                        dq_status.update(
+                            label="DQ generation failed",
+                            state="error", expanded=True,
+                        )
+
+                st.session_state.history.append(dq_result)
+                st.session_state.last_result = dq_result
+                st.markdown("---")
+
+                if dq_result.status == "success":
+                    cost = (getattr(dq_result, "cost_usd", None)
+                            or getattr(dq_result, "cost_estimate_usd", 0.0))
+                    st.success(
+                        f"Done in {dq_result.duration_seconds}s — "
+                        f"{dq_result.token_usage.get('total', 0):,} tokens — "
+                        f"est. ${cost:.4f}"
+                    )
+
+                    output      = dq_result.output
+                    parsed_json = None
+                    if isinstance(output, (dict, list)):
+                        parsed_json = output
+                    elif isinstance(output, str):
+                        cleaned = output.strip()
+                        if cleaned.startswith("```"):
+                            cleaned = cleaned.split("\n", 1)[-1]
+                            cleaned = cleaned.rsplit("```", 1)[0].strip()
+                        try:
+                            parsed_json = json.loads(cleaned)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+
+                    t1, t2, t3, t4 = st.tabs(
+                        ["Formatted", "Table / CSV", "Raw JSON", "Download"]
+                    )
+                    with t1:
+                        if parsed_json:
+                            _render_output("dq_recommender_v2", parsed_json)
+                        else:
+                            st.markdown(str(output))
+                    with t2:
+                        if parsed_json:
+                            dq_df = _to_dataframe("dq_recommender_v2", parsed_json)
+                            if dq_df is not None and not dq_df.empty:
+                                st.dataframe(dq_df, use_container_width=True)
+                                st.download_button(
+                                    "Download DQ Rules as CSV",
+                                    data=dq_df.to_csv(index=False).encode("utf-8"),
+                                    file_name=f"{dq_result.run_id}_dq_rules.csv",
+                                    mime="text/csv",
+                                    use_container_width=True,
+                                )
+                            else:
+                                st.info("No tabular output available.")
+                        else:
+                            st.info("Output is not structured JSON.")
+                    with t3:
+                        if parsed_json:
+                            st.json(parsed_json)
+                        else:
+                            st.code(str(output))
+                    with t4:
+                        cj, cc = st.columns(2)
+                        with cj:
+                            dl = json.dumps(parsed_json, indent=2) if parsed_json else str(output)
+                            st.download_button(
+                                "Download JSON",
+                                data=dl,
+                                file_name=f"{dq_result.run_id}.json",
+                                mime="application/json",
+                                use_container_width=True,
+                            )
+                        with cc:
+                            if parsed_json:
+                                dq_df2 = _to_dataframe("dq_recommender_v2", parsed_json)
+                                if dq_df2 is not None and not dq_df2.empty:
+                                    st.download_button(
+                                        "Download CSV",
+                                        data=dq_df2.to_csv(index=False).encode("utf-8"),
+                                        file_name=f"{dq_result.run_id}.csv",
+                                        mime="text/csv",
+                                        use_container_width=True,
+                                    )
+                        st.caption(f"Run ID: `{dq_result.run_id}`")
+                else:
+                    st.error(f"Failed: {dq_result.error}")
+                    with st.expander("Full error"):
+                        st.code(dq_result.error)
+
+    # Stop here — skip the standard form and execution block for this agent
+    st.stop()
 
 # =============================================================================
 # EXECUTION
