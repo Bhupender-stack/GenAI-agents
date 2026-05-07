@@ -36,6 +36,8 @@ import os
 import random
 import re
 import string
+import pandas as pd
+import yaml
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -283,6 +285,7 @@ class ExecutionHandler:
             "data_profiler":     self._run_data_profiler,
             "sample_gen":        self._run_sample_gen,
             "ingestion_cfg_gen": self._run_ingestion_cfg,
+            "sims_yaml_gen":     self._run_sims_yaml_gen,
         }
         handler = handlers.get(agent_id)
         if not handler:
@@ -476,6 +479,79 @@ class ExecutionHandler:
             })
 
         return {"status": "success", "output": {"samples": samples}}
+
+    
+
+    # ── SIMS YAML GENERATOR ────────────────────────────────────────────
+
+def _run_sims_yaml_gen(self, metadata: list[dict], user_context: str) -> dict:
+    """
+    SIMS Mapping Excel → YAML Generator
+    Deterministic, non-agentic execution
+    """
+
+    # Parse JSON context received from the UI
+    context = json.loads(user_context)
+
+    volume_path = context["volume_path"]
+    excel_file_path = context["mapping_excel_path"]
+    output_dir = context["generated_yaml_path"]
+
+    # Ensure the output folder exists
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Read the SIMS mapping Excel file
+    df = pd.read_excel(excel_file_path)
+
+    # Mandatory columns expected in the mapping document
+    required_cols = {
+        "source_system",
+        "source_table",
+        "source_column",
+        "target_table",
+        "target_column",
+        "transformation_rule",
+        "data_type",
+        "nullable",
+        "mapping_type",
+    }
+
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    generated_files = []
+
+    # Generate one YAML file per target_table
+    for target_table, grp in df.groupby("target_table"):
+        payload = {
+            "target_table": target_table,
+            "source_system": grp["source_system"].iloc[0],
+            "columns": [],
+        }
+
+        for _, row in grp.iterrows():
+            payload["columns"].append({
+                "target_column": row["target_column"],
+                "source_table": row["source_table"],
+                "source_column": row["source_column"],
+                "transformation": row["transformation_rule"],
+                "data_type": row["data_type"],
+                "nullable": bool(row["nullable"]),
+                "mapping_type": row["mapping_type"],
+            })
+
+        out_file = os.path.join(output_dir, f"{target_table}.yaml")
+        with open(out_file, "w") as f:
+            yaml.safe_dump(payload, f, sort_keys=False)
+
+        generated_files.append(out_file)
+
+    return {
+        "status": "success",
+        "generated_yaml_files": generated_files,
+        "output_path": output_dir,
+    }
 
     # ── INGESTION CONFIG GENERATOR ────────────────────────────────────────────
 
