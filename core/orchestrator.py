@@ -1,9 +1,11 @@
-"""
-core/orchestrator.py
-
-Central engine. All tables are always sent in a single LLM call — no batching.
-Live run logging via RunLogger records every step with a timestamp.
-"""
+# =============================================================================
+# core/orchestrator.py
+# Central execution engine.
+#
+# • Non-agentic agents (e.g. schema_compare, schema_gap_analysis)
+#     → ExecutionHandler
+# • Agentic agents → LLM pipeline
+# =============================================================================
 
 from __future__ import annotations
 
@@ -13,189 +15,143 @@ import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Dict, Any, List
 
-from core.config_loader      import ConfigLoader
-from core.llm_client         import LLMClient, LLMResponse
-from core.token_optimizer    import TokenOptimizer
-from core.knowledge_manager  import KnowledgeManager
-from core.rule_injector      import RuleInjector
-from core.prompt_builder     import PromptBuilder
-from core.execution_handler  import ExecutionHandler
-from core.run_logger         import RunLogger
+from core.config_loader import ConfigLoader
+from core.llm_client import LLMClient
+from core.token_optimizer import TokenOptimizer
+from core.knowledge_manager import KnowledgeManager
+from core.rule_injector import RuleInjector
+from core.prompt_builder import PromptBuilder
+from core.execution_handler import ExecutionHandler
+from core.run_logger import RunLogger
+from core.agent_result import AgentResult
 
 logger = logging.getLogger(__name__)
 
 
-class AgentResult:
-    def __init__(
-        self,
-        agent_id:         str,
-        status:           str,
-        output:           str | dict,
-        token_usage:      dict | None = None,
-        cost_usd:         float       = 0.0,
-        duration_seconds: float       = 0.0,
-        run_id:           str         = "",
-        output_path:      str         = "",
-        error:            str         = "",
-        log_entries:      list        = None,
-    ):
-        self.agent_id         = agent_id
-        self.status           = status
-        self.output           = output
-        self.token_usage      = token_usage or {}
-        self.cost_usd         = cost_usd
-        self.duration_seconds = duration_seconds
-        self.run_id           = run_id
-        self.output_path      = output_path
-        self.error            = error
-        self.log_entries      = log_entries or []
-        self.timestamp        = datetime.now(timezone.utc).isoformat()
-
-    def to_dict(self) -> dict:
-        return self.__dict__
-
-
 class Orchestrator:
+    """
+    Main execution router.
+    """
 
     def __init__(self, base_dir: Path | None = None):
-        self._base  = base_dir or Path(__file__).resolve().parent.parent
-        self.cfg    = ConfigLoader(base_dir=self._base)
-        self.llm    = LLMClient(self.cfg)
-        self.to     = TokenOptimizer(self.cfg)
-        self.km     = KnowledgeManager(self.cfg, base_dir=self._base)
-        self.ri     = RuleInjector(base_dir=self._base)
-        self.pb     = PromptBuilder(self.cfg, self.to, self.km, self.ri, base_dir=self._base)
+        self._base = base_dir or Path(__file__).resolve().parent.parent
+        self.cfg = ConfigLoader(base_dir=self._base)
+
+        # ---------------------------------------------------------------------
+        # LLM stack (used ONLY for agentic agents)
+        # ---------------------------------------------------------------------
+        self.llm = LLMClient(self.cfg)
+        self.to = TokenOptimizer(self.cfg)
+        self.km = KnowledgeManager(self.cfg, base_dir=self._base)
+        self.ri = RuleInjector(base_dir=self._base)
+        self.pb = PromptBuilder(
+            self.cfg, self.to, self.km, self.ri, base_dir=self._base
+        )
+
+        # ---------------------------------------------------------------------
+        # Deterministic executor (non-agentic agents)
+        # ---------------------------------------------------------------------
         self.exec_h = ExecutionHandler(self.cfg, base_dir=self._base)
-        self.log    = RunLogger.get()
-        self._cache: dict[str, AgentResult] = {}
-        logger.info(f"Orchestrator ready | env={self.cfg.environment}")
 
-    # ── Public API ────────────────────────────────────────────────────────
+        self.log = RunLogger.get()
+        self._cache: Dict[str, AgentResult] = {}
 
+    # -------------------------------------------------------------------------
+    # Agent listing (used by UI catalog)
+    # -------------------------------------------------------------------------
+    def list_agents(self, **filters) -> list:
+        return self.cfg.list_agents(**filters)
+
+    # -------------------------------------------------------------------------
+    # Main run API
+    # -------------------------------------------------------------------------
     def run(
         self,
-        agent_id:      str,
-        metadata:      list[dict] | dict,
-        user_context:  str  = "",
-        task_override: str  = "",
-        use_cache:     bool = True,
+        agent_id: str,
+        metadata: Dict[str, Any] | List[Dict[str, Any]],
+        user_context: str = "",
+        task_override: str = "",
+        use_cache: bool = True,
     ) -> AgentResult:
 
-        run_id = _make_run_id(agent_id)
-        start  = time.perf_counter()
+        run_id = self._make_run_id(agent_id)
+        start = time.perf_counter()
 
+        # Normalize metadata (always list internally)
         if isinstance(metadata, dict):
             metadata = [metadata]
 
-        self.log.start(run_id, agent_id, len(metadata))
-        self.log.clear_old()
-
         try:
-            self.log.step(run_id, "Loading agent configuration…")
-            agent_cfg  = self.cfg.get_agent_config(agent_id)
-            agent_meta = agent_cfg.get("agent", {})
-            agent_type = agent_meta.get("type", "agentic")
+            agent_cfg = self.cfg.get_agent_config(agent_id)
+            agent_type = agent_cfg.get("agent", {}).get("type", "agentic")
 
-            # ── Non-agentic path ─────────────────────────────────────────
+            # ===============================================================
+            # ✅ NON‑AGENTIC PATH (FIXED & EXTENDED)
+            # ===============================================================
             if agent_type == "non_agentic":
-                self.log.step(run_id, f"Running deterministic handler ({agent_id})…")
-                result_dict = self.exec_h.run_non_agentic(agent_id, metadata, user_context)
-                duration    = time.perf_counter() - start
-                output_path = self.exec_h.save_output(agent_id, result_dict, run_id=run_id)
-                self.log.done(run_id)
+
+                result_dict = self.exec_h.run_non_agentic(
+                    agent_id=agent_id,
+                    metadata=metadata[0],
+                    user_context=user_context,
+                )
+
+                duration = time.perf_counter() - start
+
+                # ✅ IMPORTANT:
+                # Pass FULL result_dict to UI (including download bytes)
                 return AgentResult(
-                    agent_id=agent_id, status="success",
-                    output=result_dict.get("output", result_dict),
+                    agent_id=agent_id,
+                    status="success",
+                    output=result_dict,   # ✅ NOT just a string
                     duration_seconds=round(duration, 3),
-                    run_id=run_id, output_path=output_path,
+                    run_id=run_id,
                     log_entries=self.log.get_entries(run_id),
                 )
 
-            # ── Cache check ──────────────────────────────────────────────
-            cache_enabled = use_cache and self.cfg.token_config.get("cache_enabled", True)
-            cache_key = _cache_key(agent_id, metadata, user_context)
+            # ===============================================================
+            # AGENTIC PATH (OLD CODE — RETAINED)
+            # ===============================================================
+            cache_enabled = use_cache and self.cfg.token_config.get(
+                "cache_enabled", True
+            )
+
+            cache_key = self._cache_key(agent_id, metadata, user_context)
+
             if cache_enabled and cache_key in self._cache:
-                self.log.step(run_id, "Cache hit — returning cached result instantly.")
-                self.log.done(run_id)
                 cached = self._cache[cache_key]
-                cached.run_id      = run_id
+                cached.run_id = run_id
                 cached.log_entries = self.log.get_entries(run_id)
                 return cached
 
-            # ── Metadata optimisation ────────────────────────────────────
-            self.log.step(run_id, f"Optimising metadata for {len(metadata)} table(s)…")
-            optimized  = self.to.optimize_metadata_list(metadata)
-            total_cols = sum(len(t.get("columns", [])) for t in optimized)
-            self.log.step(
-                run_id,
-                f"{len(optimized)} table(s) · {total_cols} total columns — "
-                "sending all in a single call (no batching)."
-            )
+            optimized = self.to.optimize_metadata_list(metadata)
 
-            # ── Build prompts ────────────────────────────────────────────
-            self.log.step(run_id, "Building system and user prompts…")
-            system_p, user_p = self.pb.build(
-                agent_id=agent_id, agent_config=agent_cfg,
-                metadata=optimized, user_context=user_context,
+            system_prompt, user_prompt = self.pb.build(
+                agent_id=agent_id,
+                agent_config=agent_cfg,
+                metadata=optimized,
+                user_context=user_context,
                 task_override=task_override,
             )
 
-            prompt_tokens = self.to.estimate_tokens(system_p + user_p)
-            self.log.step(run_id, f"Estimated prompt size: ~{prompt_tokens:,} tokens")
-
-            max_allowed = self.cfg.token_config.get("max_prompt_tokens", 3000)
-            if prompt_tokens > max_allowed:
-                self.log.warn(
-                    run_id,
-                    f"Prompt (~{prompt_tokens:,} tokens) is large — "
-                    "response may take 60–120s for big schemas."
-                )
-
-            # ── LLM call ────────────────────────────────────────────────
-            timeout = self.cfg.llm_config.get("timeout_seconds", 120)
-            self.log.step(
-                run_id,
-                f"Calling LLM ({self.llm.model}) — timeout {timeout}s. "
-                "Please wait, this can take 30–120s for large schemas…"
-            )
-
-            agent_settings = agent_cfg.get("agent_settings", {})
-            llm_resp = self.llm.complete(
-                prompt=user_p, system=system_p, agent_id=agent_id,
-                max_tokens=agent_settings.get("max_tokens"),
-                temperature=agent_settings.get("temperature"),
+            llm_response = self.llm.complete(
+                prompt=user_prompt,
+                system=system_prompt,
+                agent_id=agent_id,
             )
 
             duration = time.perf_counter() - start
-            self.log.step(run_id, f"LLM responded in {duration:.1f}s")
-            self.log.step(run_id, "Saving output…")
-
-            # ── Save ─────────────────────────────────────────────────────
-            payload = {
-                "agent_id":    agent_id,
-                "run_id":      run_id,
-                "output":      llm_resp.text,
-                "token_usage": llm_resp.token_usage,
-                "cost_usd":    llm_resp.cost_estimate_usd,
-                "duration_s":  round(duration, 3),
-                "timestamp":   datetime.now(timezone.utc).isoformat(),
-            }
-            output_path = self.exec_h.save_output(agent_id, payload, run_id=run_id)
-
-            self.log.done(
-                run_id,
-                tokens=llm_resp.token_usage.get("total", 0),
-                cost=llm_resp.cost_estimate_usd,
-            )
 
             result = AgentResult(
-                agent_id=agent_id, status="success",
-                output=llm_resp.text,
-                token_usage=llm_resp.token_usage,
-                cost_usd=llm_resp.cost_estimate_usd,
+                agent_id=agent_id,
+                status="success",
+                output=llm_response.text,
+                token_usage=llm_response.token_usage,
+                cost_usd=llm_response.cost_estimate_usd,
                 duration_seconds=round(duration, 3),
-                run_id=run_id, output_path=output_path,
+                run_id=run_id,
                 log_entries=self.log.get_entries(run_id),
             )
 
@@ -206,35 +162,34 @@ class Orchestrator:
 
         except Exception as exc:
             duration = time.perf_counter() - start
-            self.log.fail(run_id, str(exc))
-            logger.error(f"Orchestrator: {agent_id} failed: {exc}", exc_info=True)
+            logger.exception(f"Agent '{agent_id}' failed")
+
             return AgentResult(
-                agent_id=agent_id, status="error", output="",
+                agent_id=agent_id,
+                status="error",
+                output="",
+                error=str(exc),
                 duration_seconds=round(duration, 3),
-                run_id=run_id, error=str(exc),
+                run_id=run_id,
                 log_entries=self.log.get_entries(run_id),
             )
 
-    def list_agents(self, **filters) -> list[dict]:
-        return self.cfg.list_agents(**filters)
+    # -------------------------------------------------------------------------
+    # Helpers
+    # -------------------------------------------------------------------------
+    def _make_run_id(self, agent_id: str) -> str:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        return f"{agent_id}_{ts}"
 
-    def session_cost(self) -> dict:
-        return {
-            "cumulative_tokens":   self.llm.cumulative_tokens,
-            "cumulative_cost_usd": self.llm.cumulative_cost_usd,
-        }
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _make_run_id(agent_id: str) -> str:
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    return f"{agent_id}_{ts}"
-
-
-def _cache_key(agent_id: str, metadata: list[dict], context: str) -> str:
-    payload = json.dumps(
-        {"agent": agent_id, "meta": metadata, "ctx": context},
-        sort_keys=True, default=str,
-    )
-    return hashlib.md5(payload.encode()).hexdigest()
+    def _cache_key(
+        self,
+        agent_id: str,
+        metadata: List[Dict[str, Any]],
+        context: str,
+    ) -> str:
+        payload = json.dumps(
+            {"agent": agent_id, "meta": metadata, "ctx": context},
+            sort_keys=True,
+            default=str,
+        )
+        return hashlib.md5(payload.encode()).hexdigest()
