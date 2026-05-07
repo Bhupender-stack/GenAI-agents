@@ -7,7 +7,7 @@ Three input modes per agent:
   C. Manual JSON                      - paste or edit metadata directly
 
 Multi-table workspace: users build up a list of tables across sessions
-before running an agent. Relationship detection runs automatically.
+before running an agent. Relationship detection runs automatically.This is for UI
 """
 
 from __future__ import annotations
